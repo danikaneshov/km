@@ -98,7 +98,8 @@ async def get_current_stock():
         for item in doc.get("items", []):
             cat = str(item.get("category", "неизвестно")).lower()
             brand = str(item.get("brand", "неизвестно")).lower()
-            key = f"{cat}_{brand}"
+            u_size = item.get("unit_size", 0)
+            key = f"{cat}_{brand}_{u_size}"
             
             if key not in stock:
                 stock[key] = {

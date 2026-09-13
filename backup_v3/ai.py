@@ -42,15 +42,6 @@ def get_stock_tool():
     """
     pass
 
-def adjust_surplus_tool(tobacco_grams: int, coals_pieces: int):
-    """
-    Sets the manual base surplus/shortage counter (Излишек/Недостача).
-    Args:
-        tobacco_grams: Positive integer for surplus, negative for shortage of tobacco.
-        coals_pieces: Positive integer for surplus, negative for shortage of coals.
-    """
-    pass
-
 def generate_chart_tool(chart_type: str):
     """
     Generates a visual chart for the user.
@@ -61,7 +52,7 @@ def generate_chart_tool(chart_type: str):
     """
     pass
 
-tools = [record_transaction_tool, fetch_history_tool, get_stock_tool, adjust_surplus_tool, generate_chart_tool]
+tools = [record_transaction_tool, fetch_history_tool, get_stock_tool, generate_chart_tool]
 
 # Memory storage: mapping user_id -> chat session
 sessions = {}
@@ -71,21 +62,18 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
         return {"text": "Внимание: GEMINI_API_KEY не настроен."}
 
     system_instruction = (
-        "Ты - Кальянный Бот. Твоя задача - управлять складом (угли, табак) и считать кальяны.\n\n"
+        "Ты - кальянный помощник Джарвис 2.0. Твоя задача - управлять складом (угли, табак) и считать кальяны.\n\n"
         "=== СПРАВОЧНИК БРЕНДОВ ===\n"
         "ВСЕГДА исправляй опечатки и сленг (бб, дс, мастхэв, краун) на эталонные названия перед записью в базу. "
         "Эталонный список: BlackBurn, MustHave, DarkSide, Crown, Cocoloco, Sebero, Vkuss, Jam, Hell, Overdose, Sarma.\n\n"
         "=== ЗАПИСИ ===\n"
-        "1. Массовые операции: Если пишут за несколько дней ('с 1 по 10 сентября'), создавай в transactions_json ОТДЕЛЬНЫЕ объекты транзакций с разной датой!\n"
-        "2. Стафф кальяны: Вызывай record_transaction_tool (tx_type='staff') и добавь item: {\"category\": \"кальян\", \"brand\": \"стафф\", \"quantity\": 1, \"unit\": \"шт\"}.\n"
-        "3. Нескуренные чаши (замены): Вызывай record_transaction_tool (tx_type='replacement') и добавь item: {\"category\": \"кальян\", \"brand\": \"замена\", \"quantity\": 1, \"unit\": \"шт\"}.\n\n"
+        "1. Массовые операции: Если пишут за несколько дней ('с 1 по 10 сентября'), создавай в transactions_json 10 ОТДЕЛЬНЫХ объектов транзакций, каждый с разной датой!\n"
+        "2. Стафф кальяны: Вызывай record_transaction_tool (tx_type='staff') и добавь item: {\"category\": \"кальян\", \"brand\": \"стафф\", \"quantity\": 1, \"unit\": \"шт\"}.\n\n"
         "=== ОТВЕТЫ ===\n"
         "Отвечай коротко, КРАСИВО и ЧИТАБЕЛЬНО. Ты ДОЛЖЕН автоматически умножать количество на размер (граммы или штуки) и писать ИТОГО.\n"
+        "ПРАВИЛО СТАФФ-КАЛЬЯНА: Если спрашивают сколько было стафф кальянов, ВСЕГДА приписывай рядом, сколько это в ресурсах (1 стафф кальян = 23 грамма табака и 4 угля). Пример: '10 шт (Эквивалент: 230г табака и 40 углей)'. Это просто информационная приписка, списывать это со склада НЕ НАДО.\n"
         "ПО УМОЛЧАНИЮ (если не просят подробно): Выводи табак (в килограммах/граммах) и угли (в штуках) ТОЛЬКО общими суммами, без разбивки по брендам. Расписывай по брендам ТОЛЬКО если пользователь прямо попросит 'подробно' или 'какие бренды'.\n"
         "ВАЖНО: Для выделения жирным используй ТОЛЬКО HTML теги <b>текст</b>. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕН Markdown (никаких звездочек **)! В телеграме установлен HTML parse mode.\n\n"
-        "=== ИЗЛИШЕК / НЕДОСТАЧА ===\n"
-        "У нас есть независимый счетчик 'излишек/недостача'. Если просят единоразово установить излишек или недостачу, вызывай adjust_surplus_tool (положительные числа для излишка, отрицательные для недостачи).\n"
-        "Когда просят показать текущую недостачу или излишек, вызывай get_stock_tool и выводи значения surplus_tobacco_grams и surplus_coals_pieces. (Они автоматически учитывают все выкуренные стаффы и нескуренные замены).\n\n"
         "=== ИСТОРИЯ И МАТЕМАТИКА ===\n"
         "Если просят историю, вызывай fetch_history_tool. Выводи в виде списка дат. НИКАКОГО ОБЩЕГО ТЕКСТА вместо списка!\n"
         "ВНИМАНИЕ: Тебе в `exact_totals_calculated_by_system` приходит ИДЕАЛЬНАЯ СУММА. ВСЕГДА бери итоговую сумму ТОЛЬКО оттуда (tobacco_grams, coals_pieces)! НЕ ПЫТАЙСЯ считать сам!\n\n"
@@ -134,8 +122,6 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
     except Exception:
         pass
         
-    notify_text = None
-    
     if fc:
         fc_name = fc.name
         args = type(fc).to_dict(fc).get("args", {})
@@ -156,13 +142,6 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
                     inserted_id = await save_transaction(date, items, user_message, tx_type)
                     recorded_ids.append(inserted_id)
                 api_response = {"result": "success", "recorded_count": len(recorded_ids)}
-                
-                # Build notification
-                if config.LOG_CHANNEL_ID:
-                    action_name = "📦 Приход/Расход"
-                    if tx_type == "staff": action_name = "💨 Стафф кальян"
-                    elif tx_type == "replacement": action_name = "♻️ Нескуренная замена"
-                    notify_text = f"<b>{action_name}</b>\n<i>Запрос:</i> {user_message}"
             except Exception as e:
                 import logging
                 logging.error(f"Error saving to DB: {e}", exc_info=True)
@@ -208,16 +187,6 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
             try:
                 stock = await get_current_stock()
                 api_response = {"result": "success", "stock": stock}
-            except Exception as e:
-                api_response = {"result": "error", "error": str(e)}
-
-        elif fc_name == "adjust_surplus_tool":
-            try:
-                tobacco = args.get("tobacco_grams", 0)
-                coals = args.get("coals_pieces", 0)
-                from database import set_base_surplus
-                await set_base_surplus(tobacco, coals)
-                api_response = {"result": "success", "message": "Излишек/недостача обновлены."}
             except Exception as e:
                 api_response = {"result": "error", "error": str(e)}
 
@@ -279,6 +248,6 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
                 )
             )
         )
-        return {"text": final_response.text, "image": image_to_send, "notify_text": notify_text}
+        return {"text": final_response.text, "image": image_to_send}
 
-    return {"text": response.text, "image": None, "notify_text": notify_text}
+    return {"text": response.text, "image": None}

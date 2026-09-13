@@ -17,20 +17,20 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
 dp = Dispatcher()
 
-import database
-
 # Optional: simple middleware or filter for ALLOWED_TELEGRAM_ID
-async def is_allowed(user_id: int) -> bool:
-    return await database.is_admin(user_id)
+def is_allowed(user_id: int) -> bool:
+    if not config.ALLOWED_TELEGRAM_ID:
+        return True 
+    return user_id == config.ALLOWED_TELEGRAM_ID
 
 @dp.message(CommandStart())
 async def command_start_handler(message: types.Message) -> None:
-    if not await is_allowed(message.from_user.id):
+    if not is_allowed(message.from_user.id):
         await message.answer("Извините, у вас нет доступа к этому боту.")
         return
         
     await message.answer(
-        "Привет! Я твой Кальянный Бот 🤖💨\n\n"
+        "Привет! Я твой кальянный Джарвис 2.0 🤖💨\n\n"
         "Пиши мне приходы, расходы, или отправляй голосовые сообщения!\n"
         "Например:\n"
         "«угли краун 2 пачки по 72 угля»\n\n"
@@ -41,7 +41,6 @@ async def command_start_handler(message: types.Message) -> None:
 async def handle_ai_response(message: types.Message, ai_res: dict):
     text = ai_res.get("text", "")
     image_path = ai_res.get("image")
-    notify_text = ai_res.get("notify_text")
     
     if image_path and os.path.exists(image_path):
         photo = FSInputFile(image_path)
@@ -55,16 +54,9 @@ async def handle_ai_response(message: types.Message, ai_res: dict):
         if text:
             await message.answer(text)
 
-    # Postback to LOG_CHANNEL_ID
-    if notify_text and config.LOG_CHANNEL_ID:
-        try:
-            await message.bot.send_message(config.LOG_CHANNEL_ID, notify_text)
-        except Exception as e:
-            logging.error(f"Error sending to log channel: {e}")
-
 @dp.message(F.voice)
 async def voice_handler(message: types.Message, bot: Bot) -> None:
-    if not await is_allowed(message.from_user.id):
+    if not is_allowed(message.from_user.id):
         return
         
     try:
@@ -99,12 +91,7 @@ async def voice_handler(message: types.Message, bot: Bot) -> None:
 
 @dp.message(F.text)
 async def message_handler(message: types.Message) -> None:
-    if config.SECRET_PHRASE and message.text.strip() == config.SECRET_PHRASE:
-        await database.add_admin(message.from_user.id)
-        await message.delete()
-        return
-
-    if not await is_allowed(message.from_user.id):
+    if not is_allowed(message.from_user.id):
         return
         
     try:

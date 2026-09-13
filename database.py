@@ -12,13 +12,39 @@ if config.MONGODB_URI:
     client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGODB_URI, tlsCAFile=certifi.where())
     db = client.hookah_jarvis
     transactions_collection = db.transactions
+    admins_collection = db.admins
+    surplus_collection = db.surplus
+
+async def add_admin(user_id: int):
+    if admins_collection is not None:
+        await admins_collection.update_one({"user_id": user_id}, {"$set": {"user_id": user_id}}, upsert=True)
+
+async def is_admin(user_id: int) -> bool:
+    if config.ALLOWED_TELEGRAM_ID and user_id == config.ALLOWED_TELEGRAM_ID:
+        return True
+    if admins_collection is not None:
+        admin = await admins_collection.find_one({"user_id": user_id})
+        return admin is not None
+    return False
+
+async def set_base_surplus(tobacco_grams: int, coals_pieces: int):
+    if surplus_collection is not None:
+        await surplus_collection.update_one(
+            {"_id": "main"}, 
+            {"$set": {"tobacco_grams": tobacco_grams, "coals_pieces": coals_pieces}}, 
+            upsert=True
+        )
+
+async def get_base_surplus() -> dict:
+    if surplus_collection is not None:
+        doc = await surplus_collection.find_one({"_id": "main"})
+        if doc:
+            return {"tobacco_grams": doc.get("tobacco_grams", 0), "coals_pieces": doc.get("coals_pieces", 0)}
+    return {"tobacco_grams": 0, "coals_pieces": 0}
 
 async def save_transaction(date: str, items: list, raw_message: str, tx_type: str = "in"):
     """
-    Saves a new transaction (delivery 'in' or expense 'out').
-    date: ISO string like '2023-10-25T00:00:00'
-    items: list of dictionaries with extracted information
-    tx_type: "in" for deliveries, "out" for expenses
+    Saves a new transaction. tx_type: in, out, staff, replacement
     """
     if transactions_collection is None:
         raise Exception("Database is not configured.")
@@ -39,9 +65,6 @@ async def save_transaction(date: str, items: list, raw_message: str, tx_type: st
     return str(result.inserted_id)
 
 async def fetch_transactions(start_date: str = None, end_date: str = None, specific_day: int = None, tx_type: str = None):
-    """
-    Fetches transactions based on date range and optional type.
-    """
     if transactions_collection is None:
         raise Exception("Database is not configured.")
 
@@ -73,9 +96,6 @@ async def fetch_transactions(start_date: str = None, end_date: str = None, speci
     return results
 
 async def get_current_stock():
-    """
-    Calculates the current stock by summing up all 'in' and subtracting 'out' transactions.
-    """
     if transactions_collection is None:
         raise Exception("Database is not configured.")
         
@@ -83,6 +103,7 @@ async def get_current_stock():
     stock = {}
     
     staff_hookahs_total = 0
+    replacements_total = 0
     
     async for doc in cursor:
         t_type = doc.get("type", "in")
@@ -91,6 +112,12 @@ async def get_current_stock():
             for item in doc.get("items", []):
                 if "кальян" in str(item.get("category", "")).lower():
                     staff_hookahs_total += item.get("quantity", 1)
+            continue
+            
+        if t_type == "replacement":
+            for item in doc.get("items", []):
+                if "кальян" in str(item.get("category", "")).lower():
+                    replacements_total += item.get("quantity", 1)
             continue
             
         mult = 1 if t_type == "in" else -1
@@ -112,8 +139,17 @@ async def get_current_stock():
                 
             stock[key]["quantity"] += item.get("quantity", 0) * mult
             
-    # Return dictionary with stock and staff stats
+    # Calculate live surplus
+    base_surplus = await get_base_surplus()
+    net_staff_hookahs = staff_hookahs_total - replacements_total
+    
+    live_surplus_tobacco = base_surplus["tobacco_grams"] - (net_staff_hookahs * 23)
+    live_surplus_coals = base_surplus["coals_pieces"] - (net_staff_hookahs * 4)
+
     return {
         "stock": [v for v in stock.values() if v["quantity"] != 0],
-        "staff_hookahs_total": staff_hookahs_total
+        "staff_hookahs_total": staff_hookahs_total,
+        "replacements_total": replacements_total,
+        "surplus_tobacco_grams": live_surplus_tobacco,
+        "surplus_coals_pieces": live_surplus_coals
     }

@@ -146,10 +146,28 @@ async def get_current_stock():
     live_surplus_tobacco = base_surplus["tobacco_grams"] - (net_staff_hookahs * 23)
     live_surplus_coals = base_surplus["coals_pieces"] - (net_staff_hookahs * 4)
 
+    final_stock = [v for v in stock.values() if v["quantity"] != 0]
+    
+    exact_warehouse_tobacco_grams = 0
+    exact_warehouse_coals_pieces = 0
+    
+    for item in final_stock:
+        cat = item["category"]
+        size = item["unit_size"] or 1
+        qty = item["quantity"]
+        if "табак" in cat:
+            exact_warehouse_tobacco_grams += qty * size
+        elif "угл" in cat:
+            exact_warehouse_coals_pieces += qty * size
+
     return {
-        "stock": [v for v in stock.values() if v["quantity"] != 0],
+        "stock": final_stock,
         "staff_hookahs_total": staff_hookahs_total,
         "replacements_total": replacements_total,
         "surplus_tobacco_grams": live_surplus_tobacco,
-        "surplus_coals_pieces": live_surplus_coals
+        "surplus_coals_pieces": live_surplus_coals,
+        "exact_totals_calculated_by_system": {
+            "warehouse_tobacco_grams": exact_warehouse_tobacco_grams,
+            "warehouse_coals_pieces": exact_warehouse_coals_pieces
+        }
     }

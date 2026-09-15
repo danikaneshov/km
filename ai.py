@@ -20,7 +20,7 @@ def record_transaction_tool(tx_type: str, transactions_json: str):
     """
     Records one or multiple transactions.
     Args:
-        tx_type: "in" for delivery (приход), "out" for expense (расход), "staff" for staff hookahs.
+        tx_type: "in" for delivery (приход), "out" for expense (расход). Do NOT use for staff or replacements.
         transactions_json: JSON string with a list of transaction objects. Each MUST have:
                - 'date': Date in ISO format (e.g. '2023-10-25T00:00:00').
                - 'items': A list of item dicts with:
@@ -61,14 +61,15 @@ def generate_chart_tool(chart_type: str):
     """
     pass
 
-def record_usage_tool(usage_type: str, tobacco_grams: int, coals_pieces: int, date: str = ""):
+def record_usage_tool(usages_json: str):
     """
-    Records daily usage for surplus or staff hookahs.
+    Records daily usage for surplus or staff hookahs. Can record multiple at once.
     Args:
-        usage_type: 'surplus' or 'staff'
-        tobacco_grams: Positive integer for surplus (e.g. 23), negative for staff (e.g. -18).
-        coals_pieces: Positive integer for surplus (e.g. 5), negative for staff (e.g. -4).
-        date: ISO format date string.
+        usages_json: JSON string with a list of usage objects. Each MUST have:
+               - 'usage_type': 'surplus' or 'staff'
+               - 'tobacco_grams': Positive integer for surplus (e.g. 23), negative for staff (e.g. -18).
+               - 'coals_pieces': Positive integer for surplus (e.g. 5), negative for staff (e.g. -4).
+               - 'date': ISO format date string.
     """
     pass
 
@@ -90,11 +91,13 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
         "Если пользователь пишет коротко, например '+ чаша', 'чаша нескуренная', 'излишек', 'стафф', распознавай эти триггеры. "
         "ОДНАКО, ЕСЛИ ТЫ НЕ УВЕРЕН на 100%, что именно имел в виду пользователь, или не хватает данных (например, граммовки для стаффа), ОБЯЗАТЕЛЬНО ПЕРЕСПРОСИ (например: 'Ты имеешь в виду ежедневный излишек?' или 'Сколько грамм ушло на этот стафф?'). Не делай запись, пока не будешь уверен.\n\n"
         "=== ЗАПИСИ ===\n"
-        "1. Массовые операции: Если пишут за несколько дней ('с 1 по 10 сентября'), создавай в transactions_json ОТДЕЛЬНЫЕ объекты транзакций с разной датой!\n"
-        "2. Стафф кальяны и Излишек: Теперь мы записываем их отдельно через record_usage_tool.\n"
-        "   - Для 'излишек': вызывай record_usage_tool(usage_type='surplus', tobacco_grams=23, coals_pieces=5).\n"
-        "   - Для 'стафф кальян': ОБЯЗАТЕЛЬНО сначала спроси у пользователя, сколько грамм табака ушло на стафф (если он не указал). Угли фиксированно 4. Когда узнаешь граммы, вызывай record_usage_tool(usage_type='staff', tobacco_grams=-[число], coals_pieces=-4). Больше не используй record_transaction_tool для стаффа!\n"
-        "3. Нескуренные чаши (замены): Вызывай record_transaction_tool (tx_type='replacement') и добавь item: {\"category\": \"кальян\", \"brand\": \"замена\", \"quantity\": 1, \"unit\": \"шт\"}.\n\n"
+        "1. Массовые операции: Если пишут за несколько дней ('с 1 по 10 сентября'):\n"
+        "   - Для обычных транзакций (приход/расход): создавай в transactions_json ОТДЕЛЬНЫЕ объекты с разной датой!\n"
+        "   - Для излишков, стаффа и замен: ОБЯЗАТЕЛЬНО создавай в usages_json ОТДЕЛЬНЫЕ объекты с разной датой и передавай их массивом в record_usage_tool!\n"
+        "2. Стафф кальяны и Излишек: Записываем их отдельно через record_usage_tool (в массив usages_json).\n"
+        "   - Для 'излишек': объект {usage_type='surplus', tobacco_grams=23, coals_pieces=5, date=...}.\n"
+        "   - Для 'стафф кальян': ОБЯЗАТЕЛЬНО сначала спроси у пользователя, сколько грамм табака ушло на стафф (если он не указал). Угли фиксированно 4. Когда узнаешь граммы, записывай объект: {usage_type='staff', tobacco_grams=-[число], coals_pieces=-4, date=...}. Больше не используй record_transaction_tool для стаффа!\n"
+        "3. Нескуренные чаши (замены): Считай их как излишек (возврат ресурсов)! Передавай в record_usage_tool (в массив usages_json) объект: {usage_type='surplus', tobacco_grams=23, coals_pieces=4, date=...}. Больше не используй record_transaction_tool для замен.\n\n"
         "=== ОТВЕТЫ ===\n"
         "Отвечай коротко, КРАСИВО и ЧИТАБЕЛЬНО.\n"
         "ФОРМАТ ДАТ: Везде в тексте используй формат ДД.ММ.ГГГГ (например, 14.09.2026).\n"
@@ -290,17 +293,33 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
 
         elif fc_name == "record_usage_tool":
             try:
-                usage_type = args.get("usage_type", "")
-                tobacco = args.get("tobacco_grams", 0)
-                coals = args.get("coals_pieces", 0)
-                date_str = args.get("date", "") or get_current_time_str()
+                usages_str = args.get("usages_json", "[]")
+                try:
+                    usages_list = json.loads(usages_str)
+                except json.JSONDecodeError:
+                    usages_list = []
                 
-                await add_usage_log(date_str, usage_type, tobacco, coals)
-                api_response = {"result": "success", "message": "Запись добавлена в таблицу."}
+                if isinstance(usages_list, dict):
+                    usages_list = [usages_list]
+                    
+                count = 0
+                for u in usages_list:
+                    usage_type = u.get("usage_type", "")
+                    tobacco = u.get("tobacco_grams", 0)
+                    coals = u.get("coals_pieces", 0)
+                    date_str = u.get("date", "") or get_current_time_str()
+                    await add_usage_log(date_str, usage_type, tobacco, coals)
+                    count += 1
+                    
+                api_response = {"result": "success", "message": f"Добавлено записей: {count}."}
                 
-                if config.LOG_CHANNEL_ID:
-                    action_name = "📈 Излишек" if usage_type == "surplus" else "💨 Стафф кальян"
-                    notify_text = f"<b>{action_name}</b>\n<i>Запись:</i> Табак: {tobacco}г, Угли: {coals}шт."
+                if config.LOG_CHANNEL_ID and count > 0:
+                    if count == 1:
+                        u = usages_list[0]
+                        action_name = "📈 Излишек" if u.get("usage_type") == "surplus" else "💨 Стафф кальян"
+                        notify_text = f"<b>{action_name}</b>\n<i>Запись:</i> Табак: {u.get('tobacco_grams')}г, Угли: {u.get('coals_pieces')}шт."
+                    else:
+                        notify_text = f"<b>📊 Массовая запись (Излишки/Стафф)</b>\nДобавлено записей: {count}"
             except Exception as e:
                 api_response = {"result": "error", "error": str(e)}
 

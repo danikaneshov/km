@@ -172,8 +172,10 @@ async def get_current_stock():
     base_surplus = await get_base_surplus()
     usage_tobacco, usage_coals = await get_usage_log_totals()
     
-    live_surplus_tobacco = base_surplus["tobacco_grams"] + usage_tobacco
-    live_surplus_coals = base_surplus["coals_pieces"] + usage_coals
+    net_staff_hookahs_historical = staff_hookahs_total - replacements_total
+    
+    live_surplus_tobacco = base_surplus["tobacco_grams"] - (net_staff_hookahs_historical * 23) + usage_tobacco
+    live_surplus_coals = base_surplus["coals_pieces"] - (net_staff_hookahs_historical * 4) + usage_coals
 
     final_stock = [v for v in stock.values() if v["quantity"] != 0]
     

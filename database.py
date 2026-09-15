@@ -14,6 +14,7 @@ if config.MONGODB_URI:
     transactions_collection = db.transactions
     admins_collection = db.admins
     surplus_collection = db.surplus
+    usage_log_collection = db.usage_log
 
 async def add_admin(user_id: int):
     if admins_collection is not None:
@@ -41,6 +42,34 @@ async def get_base_surplus() -> dict:
         if doc:
             return {"tobacco_grams": doc.get("tobacco_grams", 0), "coals_pieces": doc.get("coals_pieces", 0)}
     return {"tobacco_grams": 0, "coals_pieces": 0}
+
+async def add_usage_log(date_str: str, usage_type: str, value1: int, value2: int):
+    """
+    usage_type: 'surplus' or 'staff'
+    value1: tobacco grams (+ for surplus, - for staff)
+    value2: coals pieces (+ for surplus, - for staff)
+    """
+    if usage_log_collection is not None:
+        count = await usage_log_collection.count_documents({})
+        doc = {
+            "id": count + 1,
+            "date": date_str,
+            "type": usage_type,
+            "value1": value1,
+            "value2": value2
+        }
+        await usage_log_collection.insert_one(doc)
+
+async def get_usage_log_totals() -> tuple[int, int]:
+    if usage_log_collection is None:
+        return 0, 0
+    cursor = usage_log_collection.find({})
+    tot_tobacco = 0
+    tot_coals = 0
+    async for doc in cursor:
+        tot_tobacco += doc.get("value1", 0)
+        tot_coals += doc.get("value2", 0)
+    return tot_tobacco, tot_coals
 
 async def save_transaction(date: str, items: list, raw_message: str, tx_type: str = "in"):
     """
@@ -141,10 +170,10 @@ async def get_current_stock():
             
     # Calculate live surplus
     base_surplus = await get_base_surplus()
-    net_staff_hookahs = staff_hookahs_total - replacements_total
+    usage_tobacco, usage_coals = await get_usage_log_totals()
     
-    live_surplus_tobacco = base_surplus["tobacco_grams"] - (net_staff_hookahs * 23)
-    live_surplus_coals = base_surplus["coals_pieces"] - (net_staff_hookahs * 4)
+    live_surplus_tobacco = base_surplus["tobacco_grams"] + usage_tobacco
+    live_surplus_coals = base_surplus["coals_pieces"] + usage_coals
 
     final_stock = [v for v in stock.values() if v["quantity"] != 0]
     

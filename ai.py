@@ -1,6 +1,6 @@
 import google.generativeai as genai
 import config
-from database import save_transaction, fetch_transactions, get_current_stock
+from database import save_transaction, fetch_transactions, get_current_stock, add_usage_log
 from charts import draw_pie_chart, draw_bar_chart
 import json
 from datetime import datetime
@@ -61,7 +61,18 @@ def generate_chart_tool(chart_type: str):
     """
     pass
 
-tools = [record_transaction_tool, fetch_history_tool, get_stock_tool, adjust_surplus_tool, generate_chart_tool]
+def record_usage_tool(usage_type: str, tobacco_grams: int, coals_pieces: int, date: str = ""):
+    """
+    Records daily usage for surplus or staff hookahs.
+    Args:
+        usage_type: 'surplus' or 'staff'
+        tobacco_grams: Positive integer for surplus (e.g. 23), negative for staff (e.g. -18).
+        coals_pieces: Positive integer for surplus (e.g. 5), negative for staff (e.g. -4).
+        date: ISO format date string.
+    """
+    pass
+
+tools = [record_transaction_tool, fetch_history_tool, get_stock_tool, adjust_surplus_tool, generate_chart_tool, record_usage_tool]
 
 # Memory storage: mapping user_id -> chat session
 sessions = {}
@@ -75,19 +86,24 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
         "=== СПРАВОЧНИК БРЕНДОВ ===\n"
         "ВСЕГДА исправляй опечатки и сленг (бб, дс, мастхэв, краун) на эталонные названия перед записью в базу. "
         "Эталонный список: BlackBurn, MustHave, DarkSide, Crown, Cocoloco, Sebero, Vkuss, Jam, Hell, Overdose, Sarma.\n\n"
+        "=== ПОНИМАНИЕ КОНТЕКСТА ===\n"
+        "Если пользователь пишет коротко, например '+ чаша', 'чаша нескуренная', 'излишек', 'стафф', распознавай эти триггеры. "
+        "ОДНАКО, ЕСЛИ ТЫ НЕ УВЕРЕН на 100%, что именно имел в виду пользователь, или не хватает данных (например, граммовки для стаффа), ОБЯЗАТЕЛЬНО ПЕРЕСПРОСИ (например: 'Ты имеешь в виду ежедневный излишек?' или 'Сколько грамм ушло на этот стафф?'). Не делай запись, пока не будешь уверен.\n\n"
         "=== ЗАПИСИ ===\n"
         "1. Массовые операции: Если пишут за несколько дней ('с 1 по 10 сентября'), создавай в transactions_json ОТДЕЛЬНЫЕ объекты транзакций с разной датой!\n"
-        "2. Стафф кальяны: Вызывай record_transaction_tool (tx_type='staff') и добавь item: {\"category\": \"кальян\", \"brand\": \"стафф\", \"quantity\": 1, \"unit\": \"шт\"}.\n"
+        "2. Стафф кальяны и Излишек: Теперь мы записываем их отдельно через record_usage_tool.\n"
+        "   - Для 'излишек': вызывай record_usage_tool(usage_type='surplus', tobacco_grams=23, coals_pieces=5).\n"
+        "   - Для 'стафф кальян': ОБЯЗАТЕЛЬНО сначала спроси у пользователя, сколько грамм табака ушло на стафф (если он не указал). Угли фиксированно 4. Когда узнаешь граммы, вызывай record_usage_tool(usage_type='staff', tobacco_grams=-[число], coals_pieces=-4). Больше не используй record_transaction_tool для стаффа!\n"
         "3. Нескуренные чаши (замены): Вызывай record_transaction_tool (tx_type='replacement') и добавь item: {\"category\": \"кальян\", \"brand\": \"замена\", \"quantity\": 1, \"unit\": \"шт\"}.\n\n"
         "=== ОТВЕТЫ ===\n"
         "Отвечай коротко, КРАСИВО и ЧИТАБЕЛЬНО.\n"
         "ФОРМАТ ДАТ: Везде в тексте используй формат ДД.ММ.ГГГГ (например, 14.09.2026).\n"
         "ПО УМОЛЧАНИЮ (Склад): Выводи остатки склада ТОЛЬКО общими суммами (сколько всего кг табака и сколько всего углей). Расписывай по брендам ТОЛЬКО если прямо попросят 'подробно'.\n"
-        "ПРАВИЛО СТАФФ-КАЛЬЯНОВ И ЗАМЕН: Если спрашивают про стафф кальяны или нескуренные чаши, выводи их ПОДРОБНО (списком) и ВСЕГДА приписывай их ресурсный эквивалент (1 чаша = 23г табака и 4 угля).\n"
         "ВАЖНО: Для выделения жирным используй ТОЛЬКО HTML теги <b>текст</b>. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕН Markdown (никаких звездочек **)! В телеграме установлен HTML parse mode.\n\n"
         "=== ИЗЛИШЕК / НЕДОСТАЧА ===\n"
-        "У нас есть независимый счетчик 'излишек/недостача'. Если просят единоразово установить излишек или недостачу, вызывай adjust_surplus_tool (положительные числа для излишка, отрицательные для недостачи).\n"
-        "Когда просят показать текущую недостачу или излишек, вызывай get_stock_tool и выводи значения surplus_tobacco_grams и surplus_coals_pieces. (Они автоматически учитывают все выкуренные стаффы и нескуренные замены).\n\n"
+        "У нас есть независимый счетчик 'излишек/недостача'. Если просят единоразово установить БАЗОВЫЙ излишек или недостачу (скорректировать цифры в ноль или задать начальную точку), вызывай adjust_surplus_tool.\n"
+        "ЕЖЕДНЕВНЫЙ ИЗЛИШЕК (появление излишков за день): Записывай через record_usage_tool(usage_type='surplus', tobacco_grams=23, coals_pieces=5).\n"
+        "Когда просят показать текущую недостачу или излишек, вызывай get_stock_tool и выводи значения surplus_tobacco_grams и surplus_coals_pieces. (Они автоматически учитывают все стаффы и ежедневные излишки).\n\n"
         "=== ИСТОРИЯ И МАТЕМАТИКА ===\n"
         "Если просят историю, вызывай fetch_history_tool. Выводи в виде списка дат. НИКАКОГО ОБЩЕГО ТЕКСТА вместо списка!\n"
         "ВНИМАНИЕ: Тебе в `exact_totals_calculated_by_system` (как в истории, так и в складе) приходит ИДЕАЛЬНАЯ СУММА. ВСЕГДА бери итоговую сумму ТОЛЬКО оттуда (warehouse_tobacco_grams, warehouse_coals_pieces)! НЕ ПЫТАЙСЯ суммировать массив stock вручную!\n\n"
@@ -270,6 +286,22 @@ async def process_user_message(user_id: int, user_message: str = "", voice_file_
             except Exception as e:
                 import logging
                 logging.error(f"Error generating chart: {e}", exc_info=True)
+                api_response = {"result": "error", "error": str(e)}
+
+        elif fc_name == "record_usage_tool":
+            try:
+                usage_type = args.get("usage_type", "")
+                tobacco = args.get("tobacco_grams", 0)
+                coals = args.get("coals_pieces", 0)
+                date_str = args.get("date", "") or get_current_time_str()
+                
+                await add_usage_log(date_str, usage_type, tobacco, coals)
+                api_response = {"result": "success", "message": "Запись добавлена в таблицу."}
+                
+                if config.LOG_CHANNEL_ID:
+                    action_name = "📈 Излишек" if usage_type == "surplus" else "💨 Стафф кальян"
+                    notify_text = f"<b>{action_name}</b>\n<i>Запись:</i> Табак: {tobacco}г, Угли: {coals}шт."
+            except Exception as e:
                 api_response = {"result": "error", "error": str(e)}
 
         # Small delay to prevent hitting limits if sending multiple rapid requests

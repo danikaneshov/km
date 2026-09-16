@@ -1,6 +1,4 @@
-aiogram==3.31.0
-motor==3.6.0
-google-generativeai==0.8.2
-python-dotenv==1.0.1
-matplotlib
-seaborn
+aiogram>=3.31
+motor>=3.6
+google-generativeai>=0.8
+python-dotenv>=1.0

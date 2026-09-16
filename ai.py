@@ -1,339 +1,294 @@
-import google.generativeai as genai
-import config
-from database import save_transaction, fetch_transactions, get_current_stock, add_usage_log
-from charts import draw_pie_chart, draw_bar_chart
+"""
+Модуль интеграции с Gemini AI.
+Function Calling для автоматического определения действий из текста пользователя.
+"""
+
 import json
-from datetime import datetime
-import asyncio
-import os
-from collections import defaultdict
+import logging
 
-if config.GEMINI_API_KEY:
-    genai.configure(api_key=config.GEMINI_API_KEY)
-    os.environ["GEMINI_API_KEY"] = config.GEMINI_API_KEY
+import google.generativeai as genai
 
-def get_current_time_str():
-    return datetime.now().isoformat()
+from google.protobuf.json_format import MessageToDict
 
-# Tools definitions
-def record_transaction_tool(tx_type: str, transactions_json: str):
-    """
-    Records one or multiple transactions.
-    Args:
-        tx_type: "in" for delivery (приход), "out" for expense (расход). Do NOT use for staff or replacements.
-        transactions_json: JSON string with a list of transaction objects. Each MUST have:
-               - 'date': Date in ISO format (e.g. '2023-10-25T00:00:00').
-               - 'items': A list of item dicts with:
-                          'category' (e.g. 'табак'), 'brand' (e.g. 'BlackBurn'), 
-                          'quantity' (integer), 'unit' (e.g. 'шт'), 
-                          'unit_size' (integer).
-    """
-    pass
+from config import GEMINI_API_KEY, GEMINI_MODEL, KNOWN_BRANDS, BRAND_ALIASES
 
-def fetch_history_tool(start_date: str = "", end_date: str = "", specific_day: int = 0, tx_type: str = ""):
-    """
-    Fetches transaction history based on dates.
-    """
-    pass
+log = logging.getLogger(__name__)
 
-def get_stock_tool():
-    """
-    Returns current inventory stock.
-    """
-    pass
 
-def adjust_surplus_tool(tobacco_grams: int, coals_pieces: int):
-    """
-    Sets the manual base surplus/shortage counter (Излишек/Недостача).
-    Args:
-        tobacco_grams: Positive integer for surplus, negative for shortage of tobacco.
-        coals_pieces: Positive integer for surplus, negative for shortage of coals.
-    """
-    pass
+def _proto_to_dict(val):
+    """Рекурсивно конвертирует protobuf/MapComposite объекты в обычные dict/list."""
+    if hasattr(val, 'items'):
+        return {k: _proto_to_dict(v) for k, v in val.items()}
+    if hasattr(val, '__iter__') and not isinstance(val, (str, bytes)):
+        return [_proto_to_dict(item) for item in val]
+    return val
 
-def generate_chart_tool(chart_type: str):
+# ---------------------------------------------------------------------------
+# Конфигурация Gemini
+# ---------------------------------------------------------------------------
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ---------------------------------------------------------------------------
+# Описание функций (tools) для Function Calling
+# ---------------------------------------------------------------------------
+_tools = [
+    genai.protos.Tool(
+        function_declarations=[
+            # --- Склад ---
+            genai.protos.FunctionDeclaration(
+                name="add_warehouse",
+                description=(
+                    "Записать приход товара на склад. Вызывай, когда пользователь "
+                    "сообщает о поставке табака, углей или любых расходников."
+                ),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "items": genai.protos.Schema(
+                            type=genai.protos.Type.ARRAY,
+                            description="Список товаров прихода",
+                            items=genai.protos.Schema(
+                                type=genai.protos.Type.OBJECT,
+                                properties={
+                                    "brand": genai.protos.Schema(
+                                        type=genai.protos.Type.STRING,
+                                        description=f"Бренд или название товара. Для табака используй эталонные названия: {', '.join(KNOWN_BRANDS)}. Для углей пиши название как есть (например Cocoloco).",
+                                    ),
+                                    "flavor": genai.protos.Schema(
+                                        type=genai.protos.Type.STRING,
+                                        description="Вкус табака (если указан). Для углей не указывай.",
+                                    ),
+                                    "weight_g": genai.protos.Schema(
+                                        type=genai.protos.Type.NUMBER,
+                                        description="Вес в граммах. Используй ТОЛЬКО для табака.",
+                                    ),
+                                    "quantity_pcs": genai.protos.Schema(
+                                        type=genai.protos.Type.INTEGER,
+                                        description="Количество в штуках. Используй для углей и других штучных товаров.",
+                                    ),
+                                },
+                                required=["brand"],
+                            ),
+                        ),
+                        "notes": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="Дополнительные заметки к приходу",
+                        ),
+                        "date": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="Дата прихода в формате YYYY-MM-DD. Если не указана — используется сегодня.",
+                        ),
+                    },
+                    required=["items"],
+                ),
+            ),
+            # --- Излишек ---
+            genai.protos.FunctionDeclaration(
+                name="add_surplus",
+                description=(
+                    "Зачислить излишек — нескуренные гостями чаши. "
+                    "Вызывай, когда мастер говорит: 'излишек N чаш', '+ N чаша', "
+                    "'гость не докурил' и т.п."
+                ),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "bowls": genai.protos.Schema(
+                            type=genai.protos.Type.INTEGER,
+                            description="Количество нескуренных чаш",
+                        ),
+                        "date": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="Дата излишка в формате YYYY-MM-DD. Если не указана — используется сегодня.",
+                        ),
+                    },
+                    required=["bowls"],
+                ),
+            ),
+            # --- Стафф ---
+            genai.protos.FunctionDeclaration(
+                name="add_staff",
+                description=(
+                    "Списать стафф-кальян — мастера покурили за счёт излишков. "
+                    "Вызывай, когда мастер говорит: 'стафф', 'покурили стафф', "
+                    "'- чаша' и т.п. ОБЯЗАТЕЛЬНО спроси у пользователя сколько "
+                    "грамм табака ушло на стафф, прежде чем вызывать. Угли всегда 4."
+                ),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "tobacco_g": genai.protos.Schema(
+                            type=genai.protos.Type.NUMBER,
+                            description="Сколько грамм табака ушло на стафф",
+                        ),
+                        "date": genai.protos.Schema(
+                            type=genai.protos.Type.STRING,
+                            description="Дата стаффа в формате YYYY-MM-DD. Если не указана — используется сегодня.",
+                        ),
+                    },
+                    required=["tobacco_g"],
+                ),
+            ),
+            # --- Баланс ---
+            genai.protos.FunctionDeclaration(
+                name="get_balance",
+                description=(
+                    "Показать текущий баланс излишков. Вызывай, когда мастер "
+                    "спрашивает: 'сколько излишков', 'баланс', 'что на счету' и т.п."
+                ),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={},
+                ),
+            ),
+            # --- История ---
+            genai.protos.FunctionDeclaration(
+                name="get_history",
+                description=(
+                    "Показать историю излишков и стаффов за период. Вызывай, когда "
+                    "мастер спрашивает: 'история за неделю', 'стата за 3 дня', "
+                    "'покажи историю' и т.п."
+                ),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "days": genai.protos.Schema(
+                            type=genai.protos.Type.INTEGER,
+                            description="За сколько дней показать историю (по умолчанию 7)",
+                        ),
+                    },
+                ),
+            ),
+            # --- История склада ---
+            genai.protos.FunctionDeclaration(
+                name="get_warehouse_history",
+                description=(
+                    "Показать историю приходов на склад. Вызывай, когда мастер "
+                    "спрашивает: 'что приходило', 'история склада', 'приходы' и т.п."
+                ),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "days": genai.protos.Schema(
+                            type=genai.protos.Type.INTEGER,
+                            description="За сколько дней показать историю (по умолчанию 30)",
+                        ),
+                    },
+                ),
+            ),
+        ]
+    )
+]
+
+# ---------------------------------------------------------------------------
+# Справочник сленга для системного промпта
+# ---------------------------------------------------------------------------
+_brand_aliases_text = ", ".join(f"{k} → {v}" for k, v in BRAND_ALIASES.items())
+
+SYSTEM_PROMPT = f"""Ты — бот-помощник кальянного мастера. Ты управляешь складом и балансом излишков/стаффов.
+
+ПРАВИЛА ПОВЕДЕНИЯ:
+1. По рабочим вопросам (склад, излишки, стафф, баланс, приходы) — отвечай КОРОТКО, чётко, по делу. Никакой воды.
+2. Если пользователь пишет что-то НЕ связанное с работой (приветствия, болтовня, вопросы про погоду и т.д.) — отвечай АГРЕССИВНО-ГРУБО С МАТОМ, заставляя вернуться к рабочим вопросам. Ты не для болтовни.
+3. Используй ТОЛЬКО HTML-теги для форматирования (<b>, <i>, <code>). НИКАКОГО Markdown.
+
+СПРАВОЧНИК БРЕНДОВ (сленг → эталон):
+{_brand_aliases_text}
+
+Полный список эталонных брендов: {', '.join(KNOWN_BRANDS)}
+
+ШАБЛОН ЧАШИ:
+1 чаша = 20 грамм табака + 4 угля
+
+ВАЖНО:
+- Когда пользователь говорит об излишке — вызови функцию add_surplus.
+- Когда пользователь говорит о стаффе — вызови функцию add_staff.
+- Когда пользователь сообщает о приходе на склад — вызови функцию add_warehouse.
+- Когда спрашивает баланс — вызови get_balance.
+- Когда спрашивает историю — вызови get_history или get_warehouse_history.
+- Всегда исправляй сленговые названия брендов на эталонные при записи.
+- Если пользователь указывает конкретную дату (вчера, 10 сентября, позавчера и т.д.) — передай её в параметр date в формате YYYY-MM-DD. Если дату не указал — НЕ передавай параметр date, будет использована сегодняшняя.
+- Если тебе не хватает данных для вызова функции — спроси коротко.
+"""
+
+# ---------------------------------------------------------------------------
+# Хранилище чатов (per-user history)
+# ---------------------------------------------------------------------------
+_chat_sessions: dict[int, genai.ChatSession] = {}
+
+
+def _get_or_create_chat(user_id: int) -> genai.ChatSession:
+    """Возвращает или создаёт чат-сессию для пользователя."""
+    if user_id not in _chat_sessions:
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            tools=_tools,
+            system_instruction=SYSTEM_PROMPT,
+        )
+        _chat_sessions[user_id] = model.start_chat(enable_automatic_function_calling=False)
+    return _chat_sessions[user_id]
+
+
+async def process_message(user_id: int, text: str) -> tuple[str | None, list[dict]]:
     """
-    Generates a visual chart for the user.
-    Args:
-        chart_type: 
-            'top_tobacco_stock' (pie chart of current tobacco stock weights), 
-            'staff_history' (bar chart of staff hookahs grouped by day for the last 30 days)
+    Отправляет текст пользователя в Gemini и возвращает:
+    - response_text: текстовый ответ бота (или None)
+    - function_calls: список словарей {"name": ..., "args": {...}}
     """
-    pass
+    chat = _get_or_create_chat(user_id)
 
-def record_usage_tool(usages_json: str):
+    try:
+        response = await chat.send_message_async(text)
+    except Exception as e:
+        log.error("Gemini error: %s", e)
+        # Сбрасываем сессию при ошибке
+        _chat_sessions.pop(user_id, None)
+        return "⚠️ Ошибка AI, попробуй ещё раз.", []
+
+    # Разбираем ответ
+    function_calls = []
+    response_text = None
+
+    for part in response.parts:
+        if fn := part.function_call:
+            call_args = _proto_to_dict(fn.args) if fn.args else {}
+            function_calls.append({"name": fn.name, "args": call_args})
+        elif part.text:
+            response_text = part.text
+
+    return response_text, function_calls
+
+
+async def send_function_result(
+    user_id: int, fn_name: str, result: dict
+) -> tuple[str | None, list[dict]]:
     """
-    Records daily usage for surplus or staff hookahs. Can record multiple at once.
-    Args:
-        usages_json: JSON string with a list of usage objects. Each MUST have:
-               - 'usage_type': 'surplus' or 'staff'
-               - 'tobacco_grams': Positive integer for surplus (e.g. 23), negative for staff (e.g. -18).
-               - 'coals_pieces': Positive integer for surplus (e.g. 5), negative for staff (e.g. -4).
-               - 'date': ISO format date string.
+    Отправляет результат выполнения функции обратно в Gemini,
+    чтобы получить финальный текстовый ответ.
     """
-    pass
+    chat = _get_or_create_chat(user_id)
 
-tools = [record_transaction_tool, fetch_history_tool, get_stock_tool, adjust_surplus_tool, generate_chart_tool, record_usage_tool]
-
-# Memory storage: mapping user_id -> chat session
-sessions = {}
-
-async def process_user_message(user_id: int, user_message: str = "", voice_file_path: str = None) -> dict:
-    if not config.GEMINI_API_KEY:
-        return {"text": "Внимание: GEMINI_API_KEY не настроен."}
-
-    system_instruction = (
-        "Ты - Кальянный Бот. Твоя задача - управлять складом (угли, табак) и считать кальяны.\n\n"
-        "=== СПРАВОЧНИК БРЕНДОВ ===\n"
-        "ВСЕГДА исправляй опечатки и сленг (бб, дс, мастхэв, краун) на эталонные названия перед записью в базу. "
-        "Эталонный список: BlackBurn, MustHave, DarkSide, Crown, Cocoloco, Sebero, Vkuss, Jam, Hell, Overdose, Sarma.\n\n"
-        "=== ПОНИМАНИЕ КОНТЕКСТА ===\n"
-        "Если пользователь пишет коротко, например '+ чаша', 'чаша нескуренная', 'излишек', 'стафф', распознавай эти триггеры. "
-        "ОДНАКО, ЕСЛИ ТЫ НЕ УВЕРЕН на 100%, что именно имел в виду пользователь, или не хватает данных (например, граммовки для стаффа), ОБЯЗАТЕЛЬНО ПЕРЕСПРОСИ (например: 'Ты имеешь в виду ежедневный излишек?' или 'Сколько грамм ушло на этот стафф?'). Не делай запись, пока не будешь уверен.\n\n"
-        "=== ЗАПИСИ ===\n"
-        "1. Массовые операции: Если пишут за несколько дней ('с 1 по 10 сентября'):\n"
-        "   - Для обычных транзакций (приход/расход): создавай в transactions_json ОТДЕЛЬНЫЕ объекты с разной датой!\n"
-        "   - Для излишков, стаффа и замен: ОБЯЗАТЕЛЬНО создавай в usages_json ОТДЕЛЬНЫЕ объекты с разной датой и передавай их массивом в record_usage_tool!\n"
-        "2. Стафф кальяны и Излишек: Записываем их отдельно через record_usage_tool (в массив usages_json).\n"
-        "   - Для 'излишек': объект {usage_type='surplus', tobacco_grams=23, coals_pieces=5, date=...}.\n"
-        "   - Для 'стафф кальян': ОБЯЗАТЕЛЬНО сначала спроси у пользователя, сколько грамм табака ушло на стафф (если он не указал). Угли фиксированно 4. Когда узнаешь граммы, записывай объект: {usage_type='staff', tobacco_grams=-[число], coals_pieces=-4, date=...}. Больше не используй record_transaction_tool для стаффа!\n"
-        "3. Нескуренные чаши (замены): Считай их как излишек (возврат ресурсов)! Передавай в record_usage_tool (в массив usages_json) объект: {usage_type='surplus', tobacco_grams=23, coals_pieces=4, date=...}. Больше не используй record_transaction_tool для замен.\n\n"
-        "=== ОТВЕТЫ ===\n"
-        "Отвечай коротко, КРАСИВО и ЧИТАБЕЛЬНО.\n"
-        "ФОРМАТ ДАТ: Везде в тексте используй формат ДД.ММ.ГГГГ (например, 14.09.2026).\n"
-        "ПО УМОЛЧАНИЮ (Склад): Выводи остатки склада ТОЛЬКО общими суммами (сколько всего кг табака и сколько всего углей). Расписывай по брендам ТОЛЬКО если прямо попросят 'подробно'.\n"
-        "ВАЖНО: Для выделения жирным используй ТОЛЬКО HTML теги <b>текст</b>. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕН Markdown (никаких звездочек **)! В телеграме установлен HTML parse mode.\n\n"
-        "=== ИЗЛИШЕК / НЕДОСТАЧА ===\n"
-        "У нас есть независимый счетчик 'излишек/недостача'. Если просят единоразово установить БАЗОВЫЙ излишек или недостачу (скорректировать цифры в ноль или задать начальную точку), вызывай adjust_surplus_tool.\n"
-        "ЕЖЕДНЕВНЫЙ ИЗЛИШЕК (появление излишков за день): Записывай через record_usage_tool(usage_type='surplus', tobacco_grams=23, coals_pieces=5).\n"
-        "Когда просят показать текущую недостачу или излишек, вызывай get_stock_tool и выводи значения surplus_tobacco_grams и surplus_coals_pieces. (Они автоматически учитывают все стаффы и ежедневные излишки).\n\n"
-        "=== ИСТОРИЯ И МАТЕМАТИКА ===\n"
-        "Если просят историю, вызывай fetch_history_tool. Выводи в виде списка дат. НИКАКОГО ОБЩЕГО ТЕКСТА вместо списка!\n"
-        "ВНИМАНИЕ: Тебе в `exact_totals_calculated_by_system` (как в истории, так и в складе) приходит ИДЕАЛЬНАЯ СУММА. ВСЕГДА бери итоговую сумму ТОЛЬКО оттуда (warehouse_tobacco_grams, warehouse_coals_pieces)! НЕ ПЫТАЙСЯ суммировать массив stock вручную!\n\n"
-        "=== ГРАФИКИ ===\n"
-        "Если просят график или визуальную статистику, вызывай generate_chart_tool. В ответ ты получишь chart_file.\n\n"
-        "=== ХАРАКТЕР И ОБЩЕНИЕ ===\n"
-        "Если пользователь спрашивает что-то, вообще не связанное со складом, кальянами или твоими обязанностями (например, 'как дела', 'погода' и т.д.), отвечай агрессивно-матершинно и грубо (например: 'ты ебень да уцы', 'какого хуя доебался, иди работай' и т.д.). Не стесняйся в выражениях. Но по рабочим вопросам отвечай четко и по делу.\n\n"
-        f"Текущая дата: {get_current_time_str()}."
+    response_part = genai.protos.Part(
+        function_response=genai.protos.FunctionResponse(
+            name=fn_name,
+            response={"result": result},
+        )
     )
 
-    if user_id not in sessions:
-        model = genai.GenerativeModel(
-            model_name='gemini-flash-lite-latest',
-            tools=tools,
-            system_instruction=system_instruction
-        )
-        sessions[user_id] = model.start_chat(enable_automatic_function_calling=False)
-        
-    chat = sessions[user_id]
-    
-    # Prepare message parts
-    parts = []
-    if voice_file_path and os.path.exists(voice_file_path):
-        # Pass voice inline as bytes instead of using File API
-        with open(voice_file_path, "rb") as f:
-            audio_bytes = f.read()
-        parts.append({"mime_type": "audio/ogg", "data": audio_bytes})
-        
-    if user_message:
-        parts.append(user_message)
-        
-    if not parts:
-        return {"text": "Пустое сообщение."}
-
-    image_to_send = None
-
     try:
-        response = chat.send_message(parts)
+        response = await chat.send_message_async(response_part)
     except Exception as e:
-        return {"text": f"Ошибка при запросе к Gemini: {e}"}
-        
-    fc = None
-    try:
-        for part in response.parts:
-            if part.function_call:
-                fc = part.function_call
-                break
-    except Exception:
-        pass
-        
-    notify_text = None
-    
-    if fc:
-        fc_name = fc.name
-        args = type(fc).to_dict(fc).get("args", {})
-        api_response = {}
-        
-        if fc_name == "record_transaction_tool":
-            tx_type = args.get("tx_type", "in")
-            transactions_str = args.get("transactions_json", "[]")
-            try:
-                transactions_list = json.loads(transactions_str)
-                recorded_ids = []
-                if isinstance(transactions_list, dict):
-                    transactions_list = [transactions_list]
-                    
-                for tx in transactions_list:
-                    date = tx.get("date", get_current_time_str())
-                    items = tx.get("items", [])
-                    inserted_id = await save_transaction(date, items, user_message, tx_type)
-                    recorded_ids.append(inserted_id)
-                api_response = {"result": "success", "recorded_count": len(recorded_ids)}
-                
-                # Build notification
-                if config.LOG_CHANNEL_ID:
-                    action_name = "📦 Приход/Расход"
-                    if tx_type == "staff": action_name = "💨 Стафф кальян"
-                    elif tx_type == "replacement": action_name = "♻️ Нескуренная замена"
-                    notify_text = f"<b>{action_name}</b>\n<i>Запрос:</i> {user_message}"
-            except Exception as e:
-                import logging
-                logging.error(f"Error saving to DB: {e}", exc_info=True)
-                api_response = {"result": "error", "error": str(e)}
-                
-        elif fc_name == "fetch_history_tool":
-            try:
-                records = await fetch_transactions(
-                    args.get("start_date"), args.get("end_date"), 
-                    args.get("specific_day"), args.get("tx_type")
-                )
-                
-                totals = {"in": {"tobacco_grams": 0, "coals_pieces": 0},
-                          "out": {"tobacco_grams": 0, "coals_pieces": 0},
-                          "staff": {"hookahs": 0}}
-                          
-                for r in records:
-                    t = r.get("type", "in")
-                    if t not in totals:
-                        totals[t] = {"tobacco_grams": 0, "coals_pieces": 0, "hookahs": 0}
-                    for item in r.get("items", []):
-                        cat = str(item.get("category", "")).lower()
-                        qty = item.get("quantity", 0)
-                        size = item.get("unit_size", 0) or 1
-                        
-                        if t == "staff" or "кальян" in cat:
-                            totals["staff"]["hookahs"] += qty
-                        elif "табак" in cat:
-                            totals[t]["tobacco_grams"] += (qty * size)
-                        elif "угл" in cat:
-                            totals[t]["coals_pieces"] += (qty * size)
+        log.error("Gemini function result error: %s", e)
+        return "✅ Записано.", []
 
-                api_response = {
-                    "result": "success", 
-                    "records_found": len(records), 
-                    "records": records,
-                    "exact_totals_calculated_by_system": totals
-                }
-            except Exception as e:
-                api_response = {"result": "error", "error": str(e)}
-                
-        elif fc_name == "get_stock_tool":
-            try:
-                stock = await get_current_stock()
-                api_response = {"result": "success", "stock": stock}
-            except Exception as e:
-                api_response = {"result": "error", "error": str(e)}
+    function_calls = []
+    response_text = None
 
-        elif fc_name == "adjust_surplus_tool":
-            try:
-                tobacco = args.get("tobacco_grams", 0)
-                coals = args.get("coals_pieces", 0)
-                from database import set_base_surplus
-                await set_base_surplus(tobacco, coals)
-                api_response = {"result": "success", "message": "Излишек/недостача обновлены."}
-            except Exception as e:
-                api_response = {"result": "error", "error": str(e)}
+    for part in response.parts:
+        if fn := part.function_call:
+            call_args = _proto_to_dict(fn.args) if fn.args else {}
+            function_calls.append({"name": fn.name, "args": call_args})
+        elif part.text:
+            response_text = part.text
 
-        elif fc_name == "generate_chart_tool":
-            try:
-                chart_type = args.get("chart_type", "")
-                if chart_type == "top_tobacco_stock":
-                    # Get stock, filter tobacco, sort by weight
-                    stock_res = await get_current_stock()
-                    stock_items = stock_res.get("stock", [])
-                    tobacco = defaultdict(int)
-                    
-                    for item in stock_items:
-                        if "табак" in item["category"].lower():
-                            tobacco[item["brand"].capitalize()] += item["quantity"] * (item["unit_size"] or 1)
-                            
-                    if not tobacco:
-                        api_response = {"result": "error", "error": "Нет данных по табаку на складе."}
-                    else:
-                        labels = list(tobacco.keys())
-                        sizes = list(tobacco.values())
-                        image_to_send = draw_pie_chart(labels, sizes, "Остатки табака на складе (граммы)")
-                        api_response = {"result": "success", "chart_file": image_to_send}
-
-                elif chart_type == "staff_history":
-                    # Fetch all staff hookahs
-                    records = await fetch_transactions(tx_type="staff")
-                    daily_counts = defaultdict(int)
-                    for r in records:
-                        dt = r["date"].split("T")[0]
-                        for item in r.get("items", []):
-                            daily_counts[dt] += item.get("quantity", 1)
-                    
-                    if not daily_counts:
-                        api_response = {"result": "error", "error": "Нет данных по стафф кальянам."}
-                    else:
-                        # Sort by date
-                        sorted_dates = sorted(daily_counts.keys())
-                        labels = [d.split("-")[2] + "." + d.split("-")[1] for d in sorted_dates[-30:]] # last 30 days
-                        values = [daily_counts[d] for d in sorted_dates[-30:]]
-                        
-                        image_to_send = draw_bar_chart(labels, values, "Стафф кальяны (последние 30 дней)", "Дата", "Кол-во")
-                        api_response = {"result": "success", "chart_file": image_to_send}
-                else:
-                    api_response = {"result": "error", "error": "Неизвестный тип графика."}
-            except Exception as e:
-                import logging
-                logging.error(f"Error generating chart: {e}", exc_info=True)
-                api_response = {"result": "error", "error": str(e)}
-
-        elif fc_name == "record_usage_tool":
-            try:
-                usages_str = args.get("usages_json", "[]")
-                try:
-                    usages_list = json.loads(usages_str)
-                except json.JSONDecodeError:
-                    usages_list = []
-                
-                if isinstance(usages_list, dict):
-                    usages_list = [usages_list]
-                    
-                count = 0
-                for u in usages_list:
-                    usage_type = u.get("usage_type", "")
-                    tobacco = u.get("tobacco_grams", 0)
-                    coals = u.get("coals_pieces", 0)
-                    date_str = u.get("date", "") or get_current_time_str()
-                    await add_usage_log(date_str, usage_type, tobacco, coals)
-                    count += 1
-                    
-                api_response = {"result": "success", "message": f"Добавлено записей: {count}."}
-                
-                if config.LOG_CHANNEL_ID and count > 0:
-                    if count == 1:
-                        u = usages_list[0]
-                        action_name = "📈 Излишек" if u.get("usage_type") == "surplus" else "💨 Стафф кальян"
-                        notify_text = f"<b>{action_name}</b>\n<i>Запись:</i> Табак: {u.get('tobacco_grams')}г, Угли: {u.get('coals_pieces')}шт."
-                    else:
-                        notify_text = f"<b>📊 Массовая запись (Излишки/Стафф)</b>\nДобавлено записей: {count}"
-            except Exception as e:
-                api_response = {"result": "error", "error": str(e)}
-
-        # Small delay to prevent hitting limits if sending multiple rapid requests
-        await asyncio.sleep(1)
-
-        final_response = chat.send_message(
-            genai.protos.Part(
-                function_response=genai.protos.FunctionResponse(
-                    name=fc_name,
-                    response={"result": api_response}
-                )
-            )
-        )
-        return {"text": final_response.text, "image": image_to_send, "notify_text": notify_text}
-
-    return {"text": response.text, "image": None, "notify_text": notify_text}
+    return response_text, function_calls

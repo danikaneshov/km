@@ -10,7 +10,7 @@ from datetime import datetime
 from aiogram import Bot, Router, types, F
 from aiogram.enums import ContentType
 
-from config import LOG_CHANNEL_ID, BOWL_TOBACCO_GRAMS, BOWL_COALS_COUNT
+from config import LOG_CHANNEL_ID, SURPLUS_TOBACCO_GRAMS, SURPLUS_COALS_COUNT, STAFF_COALS_COUNT
 from ai import process_message, send_function_result
 import db
 
@@ -157,8 +157,8 @@ async def _execute_function(
         bowls = int(fn_args.get("bowls", 1))
         date = _parse_date(fn_args.get("date"))
         doc = await db.add_surplus(bowls, user_id, date)
-        tobacco = bowls * BOWL_TOBACCO_GRAMS
-        coals = bowls * BOWL_COALS_COUNT
+        tobacco = bowls * SURPLUS_TOBACCO_GRAMS
+        coals = bowls * SURPLUS_COALS_COUNT
         date_label = fn_args.get("date", "сегодня")
 
         await _send_log(
@@ -176,7 +176,7 @@ async def _execute_function(
 
     elif fn_name == "add_staff":
         tobacco = float(fn_args.get("tobacco_g", 0))
-        coals = BOWL_COALS_COUNT
+        coals = STAFF_COALS_COUNT
         date = _parse_date(fn_args.get("date"))
         doc = await db.add_staff(tobacco, user_id, date)
         date_label = fn_args.get("date", "сегодня")

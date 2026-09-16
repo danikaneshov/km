@@ -18,8 +18,9 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = "gemini-flash-lite-latest"
 
 # --- Шаблон чаши ---
-BOWL_TOBACCO_GRAMS: int = 23
-BOWL_COALS_COUNT: int = 4
+SURPLUS_TOBACCO_GRAMS: int = 23
+SURPLUS_COALS_COUNT: int = 5
+STAFF_COALS_COUNT: int = 4
 
 # --- Справочник брендов ---
 BRAND_ALIASES: dict[str, str] = {

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import certifi
 import motor.motor_asyncio
 
-from config import MONGODB_URI, DB_NAME, BOWL_TOBACCO_GRAMS, BOWL_COALS_COUNT
+from config import MONGODB_URI, DB_NAME, SURPLUS_TOBACCO_GRAMS, SURPLUS_COALS_COUNT, STAFF_COALS_COUNT
 
 # ---------------------------------------------------------------------------
 # Подключение
@@ -73,8 +73,8 @@ async def get_warehouse_history(days: int = 30) -> list[dict]:
 # ---------------------------------------------------------------------------
 async def add_surplus(bowls: int, user_id: int, date: datetime | None = None) -> dict:
     """Зачисляет излишек на баланс (нескуренные чаши)."""
-    tobacco = bowls * BOWL_TOBACCO_GRAMS
-    coals = bowls * BOWL_COALS_COUNT
+    tobacco = bowls * SURPLUS_TOBACCO_GRAMS
+    coals = bowls * SURPLUS_COALS_COUNT
     doc = {
         "date": date or datetime.utcnow(),
         "type": "surplus",
@@ -94,7 +94,7 @@ async def add_staff(tobacco_g: float, user_id: int, date: datetime | None = None
         "type": "staff",
         "bowls": 1,
         "tobacco_g": tobacco_g,
-        "coals": BOWL_COALS_COUNT,
+        "coals": STAFF_COALS_COUNT,
         "user_id": user_id,
     }
     await balance_col.insert_one(doc)
